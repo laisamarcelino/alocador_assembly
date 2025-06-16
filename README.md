@@ -1,0 +1,3 @@
+Execução:
+make
+./teste
