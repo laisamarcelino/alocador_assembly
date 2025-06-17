@@ -20,7 +20,7 @@ LDFLAGS = -no-pie
 all: $(EXEC)
 
 alocador2.o: $(ASM)
-	$(AS) $< -o $@
+	$(AS) $< --64 -o $@
 
 exemplo.o: $(C_SRC)
 	$(CC) $(CFLAGS) $< -o $@

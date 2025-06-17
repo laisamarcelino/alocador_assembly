@@ -1,388 +1,484 @@
+# ======================================================================
+# Alocador de Memória em Assembly x86_64 (Traduzido do programa em C)
+# ======================================================================
+
+# ------------------------- Seção de Dados ----------------------------
 .section .data
-    topoInicialHeap: .quad 0            # valor origial de brk (antes das alocações)
-    topoHeap: .quad 0                   # ponteiro para o fim da heap (atual brk)
-    listaLivres: .quad 0
-    listaOcupados: .quad 0
-    format_str:     .string "%c"
-    newline_str:    .string "\n"
-    vazio_str:      .string "<vazio>\n"
-    char_hash:      .byte '#'
-    char_plus:      .byte '+'
-    char_minus:     .byte '-'
+    # Variáveis globais equivalentes à versão em C:
+    topoInicialHeap: .quad 0    # void* topoInicialHeap
+    topoHeap:        .quad 0    # void* topoHeap
+    listaLivres:     .quad 0    # Bloco* listaLivres
+    listaOcupados:   .quad 0    # Bloco* listaOcupados
 
+    vazio_str:    .string "<vazio>"  # Mensagem para heap vazio
 
+    # Estrutura do cabeçalho (equivale ao struct Bloco em C):
+    #   ocupado:4   (int)     - 1=ocupado, 0=livre
+    #   tamanho:8   (size_t)  - tamanho solicitado
+    #   prox:4      (ponteiro) - próximo bloco na lista
+.set TAM_CABECALHO, 16  # Tamanho total do cabeçalho (4+8+4=16 bytes)
+
+# ------------------------- Seção de Código ---------------------------
 .section .text
-.globl iniciaAlocador
-.globl finalizaAlocador
-.globl removeDaLista
-.globl adicionaNaLista
-.globl alocaMem
-.globl liberaMem
-.globl imprimeMapa
-.extern printf
+.global iniciaAlocador, alocaMem, liberaMem, imprimeMapa, finalizaAlocador
 
-# --------------------------------- iniciaAlocador -----------------------------------
+# ======================= iniciaAlocador ==============================
+# void iniciaAlocador()
+# Inicializa o alocador obtendo o endereço inicial do heap
+# ---------------------------------------------------------------------
+
 iniciaAlocador:
-    pushq %rbp                          # empilha (salva) %rbp
-    movq %rsp, %rbp                     # faz %rbp apontar para novo R.A 
+    movq $0, %rdi          # Solicita o endereço atual do break
+    call sbrk              # Chama sbrk(0)
+    test %rax, %rax        # Verifica se sbrk falhou
+    js .erro_init          # Salta se erro (retorno negativo)
 
-    movq $0, %rdi                       # argumento 0 para buscar o topo atual da heap
-    movq $12, %rax                      # syscall numero 12 = brk
-    syscall                             # executa a syscall
-
-    movq %rax, topoInicialHeap(%rip)
-    movq %rax, topoHeap(%rip)
-    movq $0, listaLivres(%rip)
-    movq $0, listaOcupados(%rip)
-
-    popq %rbp                           # restaura %rbp
-    ret                                 # retorna ao chamador
-
-
-# --------------------------------- finalizaAlocador ----------------------------------
-finalizaAlocador:
-    pushq %rbp
-    movq %rsp, %rbp
-    movq $0, %rdi                       # argumento 0 para buscar o topo atual da heap
-    movq $12, %rax                      # syscall numero 12 = brk
-    syscall                             # executa a syscall
-
-    movq topoInicialHeap(%rip), %rdi    # Redefine brk para o topo inicial
-    movq $12, %rax
-    syscall
-
-    movq topoInicialHeap(%rip), %rsi
-    movq %rsi, topoHeap(%rip)
-    movq $0, listaLivres(%rip)
-    movq $0, listaOcupados(%rip)
-
-    popq %rbp
+    # Inicializa variáveis globais:
+    movq %rax, topoInicialHeap(%rip)  # topoInicialHeap = sbrk(0)
+    movq %rax, topoHeap(%rip)         # topoHeap = sbrk(0)
+    movq $0, listaLivres(%rip)        # listaLivres = NULL
+    movq $0, listaOcupados(%rip)      # listaOcupados = NULL
     ret
 
-# --------------------------------- removeDaLista ----------------------------------
-removeDaLista:
-    pushq %rbp
-    movq %rsp, %rbp
-    
-    # rdi = Bloco** lista
-    # rsi = Bloco* alvo
-    movq (%rdi), %rax          # rax = *lista
-    
-    cmpq $0, %rax              # if (*lista == NULL) return
-    je fim_remove
-    cmpq $0, %rsi              # if (alvo == NULL) return
-    je fim_remove
-    
-    cmpq %rax, %rsi            # if (*lista == alvo)
-    jne procura_remove
-    
-    # *lista = alvo->prox
-    movq 16(%rsi), %rdx        # rdx = alvo->prox
-    movq %rdx, (%rdi)
-    jmp fim_remove
-
-procura_remove:
-    movq %rax, %rcx            # rcx = atual
-    
-loop_remove:
-    movq 16(%rcx), %rdx        # rdx = atual->prox
-    cmpq $0, %rdx              # if (atual->prox == NULL) break
-    je fim_remove
-    
-    cmpq %rdx, %rsi            # if (atual->prox == alvo)
-    jne continua_remove
-    
-    # atual->prox = alvo->prox
-    movq 16(%rsi), %r8
-    movq %r8, 16(%rcx)
-    jmp fim_remove
-
-continua_remove:
-    movq %rdx, %rcx
-    jmp loop_remove
-
-fim_remove:
-    popq %rbp
+.erro_init:
+    movq $0, %rax          # Retorna NULL em caso de erro
     ret
 
+# ======================== alocaMem ===================================
+# void* alocaMem(size_t num_bytes)
+# Aloca bloco de memória do tamanho solicitado
+# ---------------------------------------------------------------------
 
-# --------------------------------- adiocionaNaLista ----------------------------------
-adicionaNaLista:
-    pushq %rbp
-    movq %rsp, %rbp
-    
-    # rdi = Bloco** lista
-    # rsi = Bloco* bloco
-    
-    movq (%rdi), %rax          # rax = *lista
-    movq %rax, 16(%rsi)        # bloco->prox = *lista
-    movq %rsi, (%rdi)          # *lista = bloco
-    
-    popq %rbp
-    ret
-
-# --------------------------------- alocaMem -----------------------------------
 alocaMem:
-    pushq %rbp
-    movq %rsp, %rbp
-    pushq %rbx
-    pushq %r12
-    pushq %r13
+    push %rbp              # Prólogo padrão
+    mov %rsp, %rbp
+    push %rbx              # Salva registradores preservados
+    push %r12              
+    push %r13              
 
-    movq %rdi, %rbx             # %rbx = num_bytes
-    movq listaLivres(%rip), %r12 # %r12 = atual (iterador)
+    # Argumento num_bytes está em %rdi
+    mov %rdi, %r12         # Guarda num_bytes em r12
+    mov listaLivres(%rip), %r13  # atual = listaLivres
 
-procura_bloco_livre:
-    cmpq $0, %r12               # if (atual == NULL)
-    je aloca_novo_bloco
+.busca_livre:
+    test %r13, %r13        # Verifica se atual == NULL
+    je .aloca_heap         # Se não há blocos livres, aloca novo
 
-    # Verifica se o bloco livre tem tamanho suficiente
-    movq 8(%r12), %r13         # %r13 = atual->tamanho
-    cmpq %rbx, %r13
-    jl proximo_bloco
+    # Verifica se bloco atual é grande o suficiente:
+    movq 4(%r13), %rax     # atual->tamanho (offset 4)
+    cmp %r12, %rax         # Compara com tamanho solicitado
+    jb .proximo_bloco      # Salta se atual->tamanho < num_bytes
 
-    # Bloco adequado encontrado
-    movl $1, (%r12)            # marca como ocupado
-    movq %r12, %rdi            # arg1 = bloco
-    leaq listaLivres(%rip), %rsi # arg2 = &listaLivres
+    # Bloco livre adequado encontrado:
+    movl $1, 0(%r13)       # Marca como ocupado (atual->ocupado = 1)
+
+    # Remove da lista de livres:
+    mov %r13, %rsi         # bloco atual
+    leaq listaLivres(%rip), %rdi  # &listaLivres
     call removeDaLista
 
-    movq %r12, %rdi            # arg1 = bloco
-    leaq listaOcupados(%rip), %rsi # arg2 = &listaOcupados
-    call adicionaNaLista
+    # Adiciona à lista de ocupados:
+    mov %r13, %rsi
+    leaq listaOcupados(%rip), %rdi
+    call insereNaLista
 
-    leaq 24(%r12), %rax        # retorna ponteiro para área de dados (bloco + 24)
-    jmp fim_aloca
+    # Retorna ponteiro após o cabeçalho:
+    leaq TAM_CABECALHO(%r13), %rax  # return (void*)(atual + 1)
+    jmp .fim_aloca
 
-proximo_bloco:
-    movq 16(%r12), %r12        # atual = atual->prox
-    jmp procura_bloco_livre
+.proximo_bloco:
+    movq 12(%r13), %r13    # atual = atual->prox (offset 12)
+    jmp .busca_livre       # Continua busca
 
-aloca_novo_bloco:
-    # Calcula o tamanho total necessário (incluindo o cabeçalho do bloco)
-    movq %rbx, %rdi            # rdi = num_bytes
-    addq $24, %rdi             # rdi = tamanho total (bloco + dados)
+.aloca_heap:
+    # Calcula tamanho total necessário (alinhado em 16 bytes):
+    mov %r12, %rax         # num_bytes
+    add $15, %rax          # Arredonda para cima
+    and $-16, %rax         # Alinha em 16 bytes
+    mov %rax, %rbx         # Guarda tamanho alinhado dos dados
+    add $TAM_CABECALHO, %rax # Adiciona tamanho do cabeçalho
+    
+    # Solicita memória ao SO:
+    mov %rax, %rdi         # tamanho total
+    call sbrk
+    cmp $-1, %rax          # Verifica erro
+    je .erro               # Salta se sbrk falhou
 
-    # Calcula novo topo da heap
-    movq topoHeap(%rip), %rsi
-    addq %rdi, %rsi            # rsi = novo topo
+    # Inicializa cabeçalho do novo bloco:
+    mov topoHeap(%rip), %r13  # endereço do novo bloco
+    movl $1, (%r13)        # novo->ocupado = 1
+    mov %r12, 4(%r13)      # novo->tamanho = num_bytes (tamanho original)
+    movl $0, 12(%r13)      # novo->prox = NULL
+    
+    # Atualiza topoHeap:
+    mov topoHeap(%rip), %rdi
+    add $TAM_CABECALHO, %rdi  # Pula cabeçalho
+    add %rbx, %rdi            # Adiciona tamanho dos dados
+    mov %rdi, topoHeap(%rip)  # Atualiza global
+    
+    # Adiciona à lista de ocupados:
+    mov %r13, %rsi
+    leaq listaOcupados(%rip), %rdi
+    call insereNaLista
+    
+    # Retorna ponteiro após o cabeçalho:
+    leaq TAM_CABECALHO(%r13), %rax  # return (void*)(novo + 1)
+    jmp .fim_aloca
 
-    # Chama syscall brk para aumentar a heap até o novo topo
-    movq %rsi, %rdi            # argumento = novo topo
-    movq $12, %rax             # syscall brk
-    syscall
+.erro:
+    mov $0, %rax           # Retorna NULL em caso de erro
 
-    # Verifica se brk falhou (retornou NULL ou valor anterior)
-    cmpq %rax, %rsi
-    jne erro_alocar            # se não conseguiu mover brk, erro
-
-    # Agora podemos usar a memória entre topoHeap e novo topo
-    movq topoHeap(%rip), %r12  # r12 = início do novo bloco
-    movl $1, (%r12)            # bloco->ocupado = 1
-    movq %rbx, 8(%r12)         # bloco->tamanho = num_bytes
-    movq $0, 16(%r12)          # bloco->prox = NULL
-
-    # Atualiza topoHeap
-    movq %rsi, topoHeap(%rip)
-
-    # Adiciona à lista de ocupados
-    movq %r12, %rdi
-    leaq listaOcupados(%rip), %rsi
-    call adicionaNaLista
-
-    # Retorna ponteiro para a área de dados (logo após o cabeçalho do bloco)
-    leaq 24(%r12), %rax
-    jmp fim_aloca
-
-erro_alocar:
-    movq $0, %rax              # retorna NULL
-
-fim_aloca:
-    popq %r13
-    popq %r12
-    popq %rbx
-    popq %rbp
+.fim_aloca:
+    pop %r13               # Restaura registradores
+    pop %r12
+    pop %rbx
+    pop %rbp
     ret
 
+# ======================= removeDaLista ==============================
+# void removeDaLista(Bloco** lista, Bloco* alvo)
+# Remove bloco alvo da lista especificada
+# ---------------------------------------------------------------------
 
-# --------------------------------- liberaMem -----------------------------------
+removeDaLista:
+    push %rbp
+    mov %rsp, %rbp
+
+    # %rdi = &lista, %rsi = alvo
+
+    # Verifica ponteiros NULL:
+    movq (%rdi), %rax      # *lista
+    test %rax, %rax        # if (*lista == NULL)
+    je .retorna
+    test %rsi, %rsi        # if (alvo == NULL)
+    je .retorna
+
+    # Verifica se alvo está no início da lista:
+    cmp %rsi, %rax         # if (*lista == alvo)
+    jne .busca_loop
+
+    # Remove do início:
+    movq 12(%rsi), %rdx    # alvo->prox
+    movq %rdx, (%rdi)      # *lista = alvo->prox
+    jmp .retorna
+
+.busca_loop:
+    movq (%rdi), %rcx      # p = *lista
+
+.loop:
+    movq 12(%rcx), %rax    # p->prox
+    test %rax, %rax        # if (p->prox == NULL)
+    je .retorna            # Fim da lista
+    cmp %rsi, %rax         # if (p->prox == alvo)
+    je .ajusta_prox
+    movq %rax, %rcx        # p = p->prox
+    jmp .loop
+
+.ajusta_prox:
+    movq 12(%rsi), %rdx    # alvo->prox
+    movq %rdx, 12(%rcx)    # p->prox = alvo->prox
+
+.retorna:
+    pop %rbp
+    ret
+
+# ======================= insereNaLista ==============================
+# void insereNaLista(Bloco** lista, Bloco* b)
+# Insere bloco no início da lista especificada
+# ---------------------------------------------------------------------
+
+insereNaLista:
+    push %rbp
+    mov %rsp, %rbp
+
+    # %rdi = &lista, %rsi = b
+
+    movq (%rdi), %rax      # *lista
+    movq %rax, 12(%rsi)    # b->prox = *lista
+    movq %rsi, (%rdi)      # *lista = b
+
+    pop %rbp
+    ret
+
+# ======================== liberaMem =================================
+# int liberaMem(void* bloco)
+# Libera bloco de memória alocado
+# ---------------------------------------------------------------------
+
 liberaMem:
-    pushq %rbp
-    movq %rsp, %rbp
-    pushq %rbx
-    pushq %r12
-    pushq %r13
+    push %rbp
+    mov %rsp, %rbp
+    push %rbx              # Salva registradores
+    push %r12
+    push %r13
+    push %r14
+    push %r15
 
-    cmpq $0, %rdi              # if (ptr == NULL)
-    je erro_liberacao
+    # Verifica ponteiro NULL:
+    test %rdi, %rdi        # if (bloco == NULL)
+    jz .erro_libera           
 
-    # Recupera ponteiro para início do bloco
-    movq %rdi, %rbx
-    subq $24, %rbx             # bloco = ptr - sizeof(Bloco)
+    # Obtém cabeçalho do bloco:
+    leaq -TAM_CABECALHO(%rdi), %rbx  # b = (Bloco*)bloco - 1
+    
+    # Verifica se cabeçalho está dentro dos limites do heap:
+    movq topoInicialHeap(%rip), %rax
+    cmp %rax, %rbx         # if (b < topoInicialHeap)
+    jb .erro_libera
+    
+    movq topoHeap(%rip), %rax
+    cmp %rax, %rbx         # if (b >= topoHeap)
+    jae .erro_libera
 
-    # Marca como livre
-    movl $0, (%rbx)
+    # Marca como livre:
+    movl $0, (%rbx)        # b->ocupado = 0
 
-    # Remove da lista de ocupados
-    movq %rbx, %rdi
-    leaq listaOcupados(%rip), %rsi
+    # Remove da lista de ocupados:
+    mov %rbx, %rsi
+    leaq listaOcupados(%rip), %rdi
     call removeDaLista
 
-    # -------------------- Coalesce com próximo bloco --------------------
-    movq 8(%rbx), %rax         # tamanho do bloco atual
-    leaq 24(%rbx, %rax), %r12  # próximo bloco = atual + 24 + tamanho
+    # Adiciona à lista de livres:
+    mov %rbx, %rsi
+    leaq listaLivres(%rip), %rdi
+    call insereNaLista
 
-    cmpq topoHeap(%rip), %r12  # se próximo bloco ultrapassa topo da heap, não tenta coalescer
-    jge coalesce_anterior
-
-    cmpl $0, (%r12)            # se próximo bloco está ocupado, não coalesce
-    jne coalesce_anterior
-
-    # Remove próximo da lista de livres (vamos fundi-lo ao atual)
-    movq %r12, %rdi
-    leaq listaLivres(%rip), %rsi
+    # Coalesce com próximo bloco se estiver livre:
+    movq 4(%rbx), %rax     # b->tamanho
+    add $15, %rax          # Arredonda para cima
+    and $-16, %rax         # Alinha
+    leaq TAM_CABECALHO(%rbx, %rax), %r12  # próximo = (Bloco*)((char*)b + sizeof(Bloco) + b->tamanho)
+    
+    # Verifica se próximo está dentro do heap:
+    movq topoHeap(%rip), %r13
+    cmp %r13, %r12         # if (próximo >= topoHeap)
+    jae .coalesce_anterior
+    
+    # Verifica se próximo está livre:
+    cmpl $0, (%r12)        # if (próximo->ocupado != 0)
+    jne .coalesce_anterior
+    
+    # Remove próximo da lista de livres:
+    mov %r12, %rsi
+    leaq listaLivres(%rip), %rdi
     call removeDaLista
+    
+    # Junta os blocos:
+    movq 4(%r12), %rax     # próximo->tamanho
+    add $15, %rax          # Arredonda para cima
+    and $-16, %rax         # Alinha
+    addq $TAM_CABECALHO, %rax  # Adiciona tamanho do cabeçalho
+    addq %rax, 4(%rbx)     # b->tamanho += sizeof(Bloco) + próximo->tamanho
 
-    # Atualiza tamanho do bloco atual para incluir o próximo
-    movq 8(%r12), %rax         # tamanho do próximo
-    addq $24, %rax             # inclui cabeçalho
-    addq %rax, 8(%rbx)         # novo tamanho do bloco atual
+.coalesce_anterior:
+    # Procura bloco anterior adjacente na lista de livres:
+    movq listaLivres(%rip), %r14  # atual = listaLivres
+    
+.loop_anterior:
+    test %r14, %r14        # if (atual == NULL)
+    jz .verifica_todos_livres
+    
+    # Calcula fim do bloco atual:
+    movq 4(%r14), %rax     # atual->tamanho
+    add $15, %rax          # Arredonda para cima
+    and $-16, %rax         # Alinha
+    leaq TAM_CABECALHO(%r14, %rax), %rdx  # fim = (char*)atual + sizeof(Bloco) + atual->tamanho
+    
+    cmp %rdx, %rbx         # if (fim == b)
+    je .encontrou_anterior
+    
+    movq 12(%r14), %r14    # atual = atual->prox
+    jmp .loop_anterior
 
-coalesce_anterior:
-    # -------------------- Coalesce com bloco anterior (se adjacente) --------------------
-    movq listaLivres(%rip), %r12
-    movq $0, %r13              # r13 = anterior (NULL)
-
-loop_anterior:
-    cmpq $0, %r12
-    je fim_coalesce            # fim da lista
-
-    movq 8(%r12), %rax         # tamanho do bloco examinado
-    leaq 24(%r12, %rax), %rdi  # fim do bloco atual
-    cmpq %rdi, %rbx            # se fim == início do bloco liberado
-    jne proximo_anterior
-
-    # Bloco anterior adjacente encontrado
-    movq %r12, %r13
-    jmp coalesce
-
-proximo_anterior:
-    movq 16(%r12), %r12        # avança para próximo na lista
-    jmp loop_anterior
-
-coalesce:
-    # Remove bloco atual da lista de livres (caso já tenha sido inserido)
-    movq %rbx, %rdi
-    leaq listaLivres(%rip), %rsi
+.encontrou_anterior:
+    # Remove bloco atual da lista de livres:
+    mov %rbx, %rsi
+    leaq listaLivres(%rip), %rdi
     call removeDaLista
+    
+    # Junta com anterior:
+    movq 4(%rbx), %rax     # b->tamanho
+    add $15, %rax          # Arredonda para cima
+    and $-16, %rax         # Alinha
+    addq $TAM_CABECALHO, %rax  # Adiciona tamanho do cabeçalho
+    addq %rax, 4(%r14)     # atual->tamanho += sizeof(Bloco) + b->tamanho
 
-    # Junta bloco atual ao anterior (r13)
-    movq 8(%rbx), %rax
-    addq $24, %rax
-    addq %rax, 8(%r13)
+.verifica_todos_livres:
+    # Se não há blocos ocupados, reseta o heap:
+    movq listaOcupados(%rip), %rax
+    test %rax, %rax        # if (listaOcupados == NULL)
+    jnz .fim_libera_ok
+    
+    movq $0, listaLivres(%rip)  # listaLivres = NULL
+    movq topoInicialHeap(%rip), %rdi
+    movq %rdi, topoHeap(%rip)   # topoHeap = topoInicialHeap
+    call brk                    # Reseta ponto de break
 
-    # O bloco coalescido é o anterior
-    movq %r13, %rbx
+.fim_libera_ok:
+    xor %eax, %eax         # Retorna 0 (sucesso)
+    jmp .fim_libera
 
-fim_coalesce:
-    # Insere bloco (coalescido ou não) na lista de livres
-    movq %rbx, %rdi
-    leaq listaLivres(%rip), %rsi
-    call adicionaNaLista
+.erro_libera:
+    mov $1, %eax           # Retorna 1 (erro)
 
-    movq $0, %rax              # sucesso
-    jmp fim_libera
-
-erro_liberacao:
-    movq $1, %rax              # erro
-
-fim_libera:
-    popq %r13
-    popq %r12
-    popq %rbx
-    popq %rbp
+.fim_libera:
+    pop %r15               # Restaura registradores
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbx
+    pop %rbp
     ret
 
+# ======================= imprimeMapa ================================
+# void imprimeMapa()
+# Imprime visualização do mapa de memória
+# ---------------------------------------------------------------------
 
 imprimeMapa:
-    pushq %rbp
-    movq %rsp, %rbp
+    push %rbp
+    mov %rsp, %rbp
+    push %r12              # Salva registradores
+    push %r13
+    push %r14
+    push %r15
 
-    movq topoInicialHeap(%rip), %rsi  # início da heap
-    movq topoHeap(%rip), %rdi         # fim da heap
+    # Verifica se heap foi inicializado:
+    movq topoInicialHeap(%rip), %rax
+    test %rax, %rax        # if (topoInicialHeap == NULL)
+    je .heap_vazio
+    
+    movq topoHeap(%rip), %rbx
+    cmp %rax, %rbx         # if (topoHeap == topoInicialHeap)
+    je .heap_vazio
 
-.loop_mapa:
-    cmpq %rsi, %rdi
-    jge .fim_mapa
+    # Heap contém blocos:
+    jmp .nao_vazio
 
-    # Verifica se %rsi está dentro de algum bloco ocupado
-    movq listaOcupados(%rip), %rbx
-.procura_ocupado:
-    cmpq $0, %rbx
-    je .verifica_livre
+.heap_vazio:
+    # Imprime "<vazio>\n":
+    mov $1, %rax           # sys_write
+    mov $1, %rdi           # stdout
+    leaq vazio_str(%rip), %rsi  # "<vazio>"
+    mov $7, %rdx           # comprimento
+    syscall
+    
+    # Imprime nova linha:
+    mov $1, %rax
+    mov $1, %rdi
+    mov $10, %r14          # '\n'
+    push %r14              # Armazena na stack
+    mov %rsp, %rsi         # Ponteiro para '\n'
+    mov $1, %rdx           # 1 byte
+    syscall
+    add $8, %rsp           # Limpa stack
+    jmp .fim_imprime_func
 
-    movq %rbx, %rax                # início do bloco
-    movq 8(%rbx), %rcx             # tamanho
-    addq $24, %rcx                 # tamanho total com cabeçalho
-    leaq (%rbx, %rcx), %rdx        # fim do bloco
+.nao_vazio:
+    movq topoInicialHeap(%rip), %r12  # atual = topoInicialHeap
 
-    cmpq %rsi, %rbx
-    jb .verifica_meio_ocupado
-    jmp .proximo_ocupado
+.loop_bloco:
+    movq topoHeap(%rip), %r13
+    cmp %r13, %r12         # while (atual < topoHeap)
+    jae .fim_imprime
 
-.verifica_meio_ocupado:
-    cmpq %rsi, %rdx
-    jbe .proximo_ocupado
+    # Imprime cabeçalho (como caracteres '#'):
+    mov $TAM_CABECALHO, %r15  # sizeof(Bloco)
 
-    # Está dentro de um bloco ocupado
-    movzbl char_hash(%rip), %edi
-    call printf
-    incq %rsi
-    jmp .loop_mapa
+.loop_hash:
+    test %r15, %r15        # for (i=0; i<sizeof(Bloco); i++)
+    jz .depois_hash
+    
+    mov $1, %rax           # sys_write
+    mov $1, %rdi           # stdout
+    mov $35, %r14          # '#'
+    push %r14
+    mov %rsp, %rsi         # Ponteiro para '#'
+    mov $1, %rdx           # 1 byte
+    syscall
+    add $8, %rsp
+    
+    dec %r15
+    jmp .loop_hash
 
-.proximo_ocupado:
-    movq 16(%rbx), %rbx
-    jmp .procura_ocupado
+.depois_hash:
+    # Determina caractere de status:
+    movl (%r12), %eax      # atual->ocupado
+    test %eax, %eax        # if (ocupado)
+    je .usa_menos
+    mov $43, %r14          # '+' para ocupado (alterado de '*' original)
+    jmp .print_dados
 
-.verifica_livre:
-    movq listaLivres(%rip), %rbx
-.procura_livre:
-    cmpq $0, %rbx
-    je .imprime_traco
+.usa_menos:
+    mov $45, %r14          # '-' para livre
 
-    movq %rbx, %rax
-    movq 8(%rbx), %rcx
-    addq $24, %rcx
-    leaq (%rbx, %rcx), %rdx
+.print_dados:
+    # Imprime área de dados:
+    movq 4(%r12), %r15     # atual->tamanho
 
-    cmpq %rsi, %rbx
-    jb .verifica_meio_livre
-    jmp .proximo_livre
+.loop_dados:
+    test %r15, %r15        # for (i=0; i<tamanho; i++)
+    jz .avanca_bloco
+    
+    mov $1, %rax           # sys_write
+    mov $1, %rdi           # stdout
+    push %r14              # '+' ou '-'
+    mov %rsp, %rsi         # Ponteiro para char
+    mov $1, %rdx           # 1 byte
+    syscall
+    add $8, %rsp
+    
+    dec %r15
+    jmp .loop_dados
 
-.verifica_meio_livre:
-    cmpq %rsi, %rdx
-    jbe .proximo_livre
+.avanca_bloco:
+    # Avança para próximo bloco:
+    movq 4(%r12), %rax     # atual->tamanho
+    add $15, %rax          # Arredonda para cima
+    and $-16, %rax         # Alinha
+    add $TAM_CABECALHO, %rax  # Adiciona tamanho do cabeçalho
+    add %rax, %r12         # atual = (char*)atual + tamanho_total
+    jmp .loop_bloco
 
-    # Está dentro de um bloco livre
-    movzbl char_plus(%rip), %edi
-    call printf
-    incq %rsi
-    jmp .loop_mapa
+.fim_imprime:
+    # Imprime nova linha:
+    mov $1, %rax
+    mov $1, %rdi
+    mov $10, %r14          # '\n'
+    push %r14
+    mov %rsp, %rsi
+    mov $1, %rdx
+    syscall
+    add $8, %rsp
 
-.proximo_livre:
-    movq 16(%rbx), %rbx
-    jmp .procura_livre
-
-.imprime_traco:
-    movzbl char_minus(%rip), %edi
-    call printf
-    incq %rsi
-    jmp .loop_mapa
-
-.fim_mapa:
-    # imprime \n
-    movq $newline_str, %rdi
-    call printf
-
-    popq %rbp
+.fim_imprime_func:
+    pop %r15               # Restaura registradores
+    pop %r14
+    pop %r13
+    pop %r12
+    pop %rbp
     ret
+
+# ===================== finalizaAlocador =============================
+# void finalizaAlocador()
+# Reseta o alocador e libera toda a memória
+# ---------------------------------------------------------------------
+
+finalizaAlocador:
+    push %rbp
+    mov %rsp, %rbp
+
+    # Reseta heap para posição inicial:
+    movq topoInicialHeap(%rip), %rdi
+    call brk
+
+    # Reseta todas as variáveis globais:
+    movq $0, topoInicialHeap(%rip)
+    movq $0, topoHeap(%rip)
+    movq $0, listaLivres(%rip)
+    movq $0, listaOcupados(%rip)
+
+    pop %rbp
+    ret
+
+    
